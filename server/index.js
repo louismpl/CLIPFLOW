@@ -37,7 +37,12 @@ function extractHeatmapPeaks(info) {
 }
 
 async function getVideoInfo(url) {
-  const json = await runYtDlp([url, '--dump-json', '--no-download']);
+  const json = await runYtDlp([
+    url,
+    '--dump-json',
+    '--no-download',
+    '--user-agent', 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+  ]);
   const info = JSON.parse(json);
   info.heatmap_peaks = extractHeatmapPeaks(info);
   return info;
@@ -330,6 +335,21 @@ async function downloadVideo(url, clipStart, clipEnd) {
     '--no-warnings'
   ]);
   return { outputPath, info, sectionStart: 0 };
+}
+
+async function downloadAudioOnly(url) {
+  const info = await getVideoInfo(url);
+  const id = info.id;
+  const outputPath = path.join(downloadsDir, `${id}.audio.webm`);
+  if (fs.existsSync(outputPath)) return { outputPath, info };
+
+  await runYtDlp([
+    url,
+    '-f', 'bestaudio/best',
+    '-o', outputPath,
+    '--no-warnings'
+  ]);
+  return { outputPath, info };
 }
 
 function sanitizeFilename(text) {
@@ -751,22 +771,18 @@ app.post('/api/analyze', async (req, res) => {
 
     console.log('[analyze] start:', videoUrl, 'duration:', videoDuration);
 
-    // 1. Download video (needed for audio/scene analysis)
-    console.log('[analyze] downloading video...');
-    const dl = await downloadVideo(videoUrl);
-    const videoPath = dl.outputPath;
+    // 1. Download audio only (10x faster than full video)
+    console.log('[analyze] downloading audio only...');
+    const dl = await downloadAudioOnly(videoUrl);
+    const audioPath = dl.outputPath;
 
-    // 2. Parallel extraction : transcript, audio, scenes
-    console.log('[analyze] extracting transcript + audio + scenes...');
-    const [transcriptRes, audioRes, sceneRes] = await Promise.all([
+    // 2. Parallel extraction : transcript + audio analysis
+    console.log('[analyze] extracting transcript + audio...');
+    const [transcriptRes, audioRes] = await Promise.all([
       getVideoTranscript(videoUrl, info.title || ''),
-      extractAudioVolume(videoPath, 0, videoDuration).catch(e => {
+      extractAudioVolume(audioPath, 0, videoDuration).catch(e => {
         console.error('Audio error:', e.message);
         return { peaks: [], silenceMoments: [], rhythmChanges: [] };
-      }),
-      detectSceneChanges(videoPath).catch(e => {
-        console.error('Scene detection error:', e.message);
-        return [];
       })
     ]);
 
@@ -774,7 +790,6 @@ app.post('/api/analyze', async (req, res) => {
     const silenceMoments = audioRes.silenceMoments || [];
     const rhythmChanges = audioRes.rhythmChanges || [];
     const heatmapPeaks = info.heatmap_peaks || [];
-    const scenePeaks = sceneRes || [];
 
     let windows = [];
     let words = [];
@@ -785,7 +800,7 @@ app.post('/api/analyze', async (req, res) => {
       } catch {}
     }
 
-    console.log('[analyze] signals:', { heatmap: heatmapPeaks.length, audio: audioPeaks.length, scenes: scenePeaks.length, silence: silenceMoments.length, rhythm: rhythmChanges.length, transcriptWindows: windows.length });
+    console.log('[analyze] signals:', { heatmap: heatmapPeaks.length, audio: audioPeaks.length, silence: silenceMoments.length, rhythm: rhythmChanges.length, transcriptWindows: windows.length });
 
     const emotionalWords = ['incroyable', 'impossible', 'regardez', 'wow', 'non', 'what', 'ouah', 'dingue', 'fou', 'génial', 'choquant', 'spectaculaire', 'jamais', 'toujours', 'best', 'amazing', 'crazy', 'insane', 'love', 'hate', 'need', 'want'];
 
@@ -794,7 +809,6 @@ app.post('/api/analyze', async (req, res) => {
 
     for (const p of heatmapPeaks) interestPoints.push({ time: p, source: 'heatmap', weight: 1.0 });
     for (const p of audioPeaks) interestPoints.push({ time: p, source: 'audio', weight: 0.75 });
-    for (const p of scenePeaks) interestPoints.push({ time: p, source: 'scene', weight: 0.5 });
     for (const r of rhythmChanges) interestPoints.push({ time: r.time, source: 'rhythm', weight: 0.6 });
 
     for (const w of windows) {
@@ -959,7 +973,6 @@ app.post('/api/analyze', async (req, res) => {
       rawStats: {
         heatmapPeaks: heatmapPeaks.length,
         audioPeaks: audioPeaks.length,
-        scenePeaks: scenePeaks.length,
         transcriptWindows: windows.length
       }
     });
