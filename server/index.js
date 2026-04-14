@@ -577,15 +577,66 @@ async function extractAudioVolume(inputPath, start = 0, end = null) {
     rmsValues.push({ t: start + (i / sampleRate), rms });
   }
 
-  if (rmsValues.length === 0) return { rmsValues: [], peaks: [] };
+  if (rmsValues.length === 0) return { rmsValues: [], peaks: [], silenceMoments: [], rhythmChanges: [] };
 
   const mean = rmsValues.reduce((a, v) => a + v.rms, 0) / rmsValues.length;
   const variance = rmsValues.reduce((a, v) => a + Math.pow(v.rms - mean, 2), 0) / rmsValues.length;
   const std = Math.sqrt(variance);
   const threshold = mean + 1.2 * std;
+  const silenceThreshold = mean * 0.3;
 
   const peaks = rmsValues.filter(v => v.rms > threshold).map(v => v.t);
-  return { rmsValues, peaks };
+
+  // Silences longs (> 3s consécutifs sous le seuil)
+  const silenceMoments = [];
+  let silenceStart = null;
+  for (const v of rmsValues) {
+    if (v.rms < silenceThreshold) {
+      if (silenceStart === null) silenceStart = v.t;
+    } else {
+      if (silenceStart !== null && v.t - silenceStart > 3) {
+        silenceMoments.push((silenceStart + v.t) / 2);
+      }
+      silenceStart = null;
+    }
+  }
+
+  // Changements de rythme brusques
+  const rhythmChanges = [];
+  for (let i = 1; i < rmsValues.length; i++) {
+    const prev = rmsValues[i - 1].rms;
+    const curr = rmsValues[i].rms;
+    if (prev > 1500 && curr < 300) {
+      rhythmChanges.push({ time: rmsValues[i].t, type: 'silence_after_noise', score: 25 });
+    } else if (prev < 400 && curr > 2000) {
+      rhythmChanges.push({ time: rmsValues[i].t, type: 'explosion_after_calm', score: 30 });
+    }
+  }
+
+  return { rmsValues, peaks, silenceMoments, rhythmChanges };
+}
+
+async function detectSceneChanges(inputPath) {
+  try {
+    const { stderr } = await execFileAsync(ffmpegPath, [
+      '-i', inputPath,
+      '-filter:v', 'select=gt(scene\\,0.3)',
+      '-f', 'null',
+      '-'
+    ], { maxBuffer: 1024 * 1024 * 10 });
+    const scenes = [];
+    const regex = /pts_time:([0-9.]+)/g;
+    let match;
+    while ((match = regex.exec(stderr)) !== null) scenes.push(parseFloat(match[1]));
+    return scenes;
+  } catch (e) {
+    const stderr = e.stderr || '';
+    const scenes = [];
+    const regex = /pts_time:([0-9.]+)/g;
+    let match;
+    while ((match = regex.exec(stderr)) !== null) scenes.push(parseFloat(match[1]));
+    return scenes;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -604,31 +655,54 @@ function scoreSegmentText(text) {
   if (words.length < 5) return 0;
   let score = 50;
 
-  const sponsorKillers = [
+  // Sponsors / promo : -50 points (pas kill direct)
+  const sponsorWords = [
     'sponsor','sponsorisé','sponsored by','vidéo sponsorisée','en collaboration avec','présenté par','soutenu par','partenaire','partenariat','code promo','code réduction','lien affilié','lien en description','découvrez dans la description','achetez','boutique officielle','merch','merchandise','tipeee','patreon','paypal','utip','buy me a coffee','hellofresh','nordvpn','expressvpn','protonvpn','surfshark','raid shadow legends'
   ];
-  for (const sk of sponsorKillers) {
-    if (lower.includes(sk)) return 0;
+  for (const sw of sponsorWords) {
+    if (lower.includes(sw)) score -= 50;
   }
 
+  // Meta content (likes, subscribe, thanks) : -40 points par occurrence, kill si >= 2
   const metaWords = ['abonne-toi','abonnez-vous','abonne','active la cloche','notification','likez','laissez un like','like and subscribe','hit the bell','check out my','check the link','suis-moi sur','follow me','soutenez-moi','merci à','remercie','remercier','un grand merci','description','lien en bio','shop','instagram','twitter','tiktok'];
   let metaHits = 0;
   metaWords.forEach(mw => { if (lower.includes(mw)) metaHits++; });
   if (metaHits >= 2) return 0;
   score -= metaHits * 40;
 
+  // Questions rhétoriques / engagement
   const questionCount = (text.match(/\?/g) || []).length;
-  score += questionCount * 15;
-  const exclCount = (text.match(/\!/g) || []).length;
-  score += exclCount * 12;
-  const numberCount = (text.match(/\d+/g) || []).length;
-  score += numberCount * 10;
+  score += questionCount * 18;
 
+  // Exclamations = émotion
+  const exclCount = (text.match(/\!/g) || []).length;
+  score += exclCount * 14;
+
+  // Chiffres surprenants
+  const numberCount = (text.match(/\d+/g) || []).length;
+  score += numberCount * 12;
+
+  // Power words
   const powerWords = ['meilleur','pire','incroyable','impossible','génial','horrible','parfait','dingue','fou','énorme','massif','absurde','ridicule','spectaculaire','choquant','surprenant','jamais','toujours','jamais vu','inouï','exceptionnel','ultra','mega','hyper','super','terrible','magnifique','déteste','adore','aime','veux','besoin','sais','pense','crois','imagine','résultat','secret','vérité','mensonge','problème','solution','astuce','conseil','erreur','victoire','défaite','succès','échec','wow','résultats','regardez','attention','découvrez','révélation','choc','époustouflant','mind blowing','crazy','insane','legendary','best','worst','fail','win','clutch','terrifying','hilarious','emotional','touching','never','always','love','hate','need','want','know','feel','think','believe','amazing','unbelievable','beautiful'];
   powerWords.forEach(pw => { if (lower.includes(pw)) score += 12; });
 
+  // Narration tendue
   const narrativeWords = ['mais','pourtant','alors que','sauf que','finalement','en fait','surtout','notamment','étonnamment','curieusement','bizarrement','heureusement','malheureusement'];
   narrativeWords.forEach(nw => { if (lower.includes(nw)) score += 8; });
+
+  // Hooks spécifiques qui performent
+  const hookPatterns = [
+    /tu sais ce qui/i, /imaginez/i, /imagines?/i, /attends? de voir/i, /tu vas halluciner/i,
+    /je parie que/i, /défi accepté/i, /le pire/i, /le meilleur/i, /avant\/après/i,
+    /avant et après/i, /personne ne/i, /tout le monde/i, /personne n'\w+/i
+  ];
+  hookPatterns.forEach(rx => { if (rx.test(text)) score += 20; });
+
+  // Répétitions = remplissage : pénaliser si même mot > 5 fois
+  const wordCounts = {};
+  words.forEach(w => { wordCounts[w] = (wordCounts[w] || 0) + 1; });
+  const maxRepeat = Math.max(0, ...Object.values(wordCounts));
+  if (maxRepeat > 5) score -= (maxRepeat - 5) * 8;
 
   return score;
 }
@@ -671,102 +745,102 @@ app.post('/api/analyze', async (req, res) => {
     const { videoUrl, clipDuration = 45, minDuration = 30, userQuery } = req.body;
     if (!videoUrl) return res.status(400).json({ error: 'videoUrl requis' });
 
-    // 1. Récupérer toutes les données en parallèle quand possible
     const info = await getVideoInfo(videoUrl);
     const videoDuration = info.duration || 0;
     if (videoDuration <= 0) return res.status(400).json({ error: 'Durée invalide' });
 
     console.log('[analyze] start:', videoUrl, 'duration:', videoDuration);
 
-    // Download video + transcript in parallel
-    // Use downloadVideo without section args to avoid slow --recode-video path
-    console.log('[analyze] downloading video + transcript...');
-    const [downloadResult, transcriptData] = await Promise.all([
-      downloadVideo(videoUrl),
-      getVideoTranscript(videoUrl, info.title || '')
+    // 1. Download video (needed for audio/scene analysis)
+    console.log('[analyze] downloading video...');
+    const dl = await downloadVideo(videoUrl);
+    const videoPath = dl.outputPath;
+
+    // 2. Parallel extraction : transcript, audio, scenes
+    console.log('[analyze] extracting transcript + audio + scenes...');
+    const [transcriptRes, audioRes, sceneRes] = await Promise.all([
+      getVideoTranscript(videoUrl, info.title || ''),
+      extractAudioVolume(videoPath, 0, videoDuration).catch(e => {
+        console.error('Audio error:', e.message);
+        return { peaks: [], silenceMoments: [], rhythmChanges: [] };
+      }),
+      detectSceneChanges(videoPath).catch(e => {
+        console.error('Scene detection error:', e.message);
+        return [];
+      })
     ]);
 
-    const { outputPath: videoPath } = downloadResult;
-    console.log('[analyze] video ready:', videoPath);
-
-    console.log('[analyze] extracting audio volume...');
-    const { peaks: audioPeaks } = await extractAudioVolume(videoPath, 0, videoDuration);
-    console.log('[analyze] audio peaks:', audioPeaks.length);
-
+    const audioPeaks = audioRes.peaks || [];
+    const silenceMoments = audioRes.silenceMoments || [];
+    const rhythmChanges = audioRes.rhythmChanges || [];
     const heatmapPeaks = info.heatmap_peaks || [];
-    console.log('[analyze] heatmap peaks:', heatmapPeaks.length);
+    const scenePeaks = sceneRes || [];
 
     let windows = [];
     let words = [];
-    if (transcriptData) {
+    if (transcriptRes) {
       try {
-        windows = JSON.parse(transcriptData.windows || '[]');
-        words = JSON.parse(transcriptData.words || '[]');
+        windows = JSON.parse(transcriptRes.windows || '[]');
+        words = JSON.parse(transcriptRes.words || '[]');
       } catch {}
     }
-    console.log('[analyze] transcript windows:', windows.length);
+
+    console.log('[analyze] signals:', { heatmap: heatmapPeaks.length, audio: audioPeaks.length, scenes: scenePeaks.length, silence: silenceMoments.length, rhythm: rhythmChanges.length, transcriptWindows: windows.length });
 
     const emotionalWords = ['incroyable', 'impossible', 'regardez', 'wow', 'non', 'what', 'ouah', 'dingue', 'fou', 'génial', 'choquant', 'spectaculaire', 'jamais', 'toujours', 'best', 'amazing', 'crazy', 'insane', 'love', 'hate', 'need', 'want'];
 
-    // 2. APPROCHE PIC-FIRST : on détecte les MOMENTS FORTS, puis on crée des clips centrés dessus
-
-    // 2a. Construire les points d'intérêt à partir des trois signaux
+    // 1. Build interest points from all signals
     const interestPoints = [];
 
-    // Points heatmap
-    for (const p of heatmapPeaks) {
-      interestPoints.push({ time: p, source: 'heatmap', score: 30 });
-    }
+    for (const p of heatmapPeaks) interestPoints.push({ time: p, source: 'heatmap', weight: 1.0 });
+    for (const p of audioPeaks) interestPoints.push({ time: p, source: 'audio', weight: 0.75 });
+    for (const p of scenePeaks) interestPoints.push({ time: p, source: 'scene', weight: 0.5 });
+    for (const r of rhythmChanges) interestPoints.push({ time: r.time, source: 'rhythm', weight: 0.6 });
 
-    // Points audio
-    for (const p of audioPeaks) {
-      interestPoints.push({ time: p, source: 'audio', score: 25 });
-    }
-
-    // Points transcript : chaque window qui a un bon score texte
     for (const w of windows) {
       const mid = (w.start + w.end) / 2;
       const textScore = scoreSegmentText(w.text);
-      if (textScore > 60) {
-        interestPoints.push({ time: mid, source: 'transcript', score: textScore * 0.4 });
+      if (textScore > 55) {
+        interestPoints.push({ time: mid, source: 'transcript', weight: textScore / 200 });
       }
     }
 
-    // Agréger les points proches (< 5s) en un seul pic plus fort
+    // Merge close points (< 4s)
     interestPoints.sort((a, b) => a.time - b.time);
     const mergedPoints = [];
     for (const p of interestPoints) {
       const last = mergedPoints[mergedPoints.length - 1];
-      if (last && Math.abs(last.time - p.time) < 5) {
-        last.score += p.score * 0.7;
+      if (last && Math.abs(last.time - p.time) < 4) {
+        last.score += p.weight;
         last.sources = Array.from(new Set([...(last.sources || []), p.source]));
       } else {
-        mergedPoints.push({ time: p.time, score: p.score, sources: [p.source] });
+        mergedPoints.push({ time: p.time, score: p.weight, sources: [p.source] });
       }
     }
 
-    // Trier par score décroissant
-    mergedPoints.sort((a, b) => b.score - a.score);
-    console.log('[analyze] merged interest points:', mergedPoints.slice(0, 10).map(p => ({ time: p.time, score: Math.round(p.score), sources: p.sources })));
+    // 2. Build adaptive-duration clip around each peak
+    function buildClipAroundPeak(peakTime) {
+      // Adaptive duration : base = clipDuration, shrink if dense, expand if spread
+      const localHeatmap = heatmapPeaks.filter(p => Math.abs(p - peakTime) < 15).length;
+      const localAudio = audioPeaks.filter(p => Math.abs(p - peakTime) < 15).length;
+      const density = localHeatmap + localAudio;
+      let targetDuration = clipDuration;
+      if (density >= 3) targetDuration = Math.max(minDuration, clipDuration - 15);
+      else if (density === 0) targetDuration = Math.min(60, clipDuration + 10);
 
-    // 3. Pour chaque point d'intérêt, créer un clip CENTRÉ sur ce point
-    function buildClipAroundPeak(peakTime, targetDuration) {
       let start = Math.max(0, peakTime - targetDuration / 2);
       let end = Math.min(videoDuration, start + targetDuration);
-      // Réajuster si on dépasse à la fin
       if (end - start < targetDuration && start > 0) {
         start = Math.max(0, end - targetDuration);
       }
 
-      // Snap end sur une phrase complète dans ±5s
+      // Snap end to phrase
       const phraseCandidates = windows.filter(w => w.end >= end - 5 && w.end <= end + 5 && w.text.length > 10 && /[.!?]$/i.test(w.text));
       if (phraseCandidates.length > 0) {
         end = phraseCandidates.sort((a, b) => Math.abs(a.end - end) - Math.abs(b.end - end))[0].end;
       }
-      // Si end est avant start, on corrige
       if (end <= start) end = start + targetDuration;
 
-      // Recalculer le score EXACT de ce segment
       const segmentWindows = windows.filter(w => w.start >= start && w.end <= end);
       const segmentText = segmentWindows.map(w => w.text).join(' ');
       const textScore = scoreSegmentText(segmentText);
@@ -776,26 +850,33 @@ app.post('/api/analyze', async (req, res) => {
       const phraseEnd = windows.find(w => w.end >= start && w.end <= end && w.text.length > 10 && /[.!?]$/i.test(w.text));
       const emotionBoost = emotionalWords.filter(w => segmentText.toLowerCase().includes(w)).length * 15;
 
+      // Silence penalty : long silence without heatmap = boring
+      const silencesInSegment = silenceMoments.filter(t => t >= start && t <= end).length;
+      const silencePenalty = silencesInSegment * 15;
+
       // Centre quality
       const center = (start + end) / 2;
-      const heatmapDists = heatmapPeaks.filter(p => p >= start && p <= end).map(p => Math.abs(p - center));
-      const audioDists = audioPeaks.filter(p => p >= start && p <= end).map(p => Math.abs(p - center));
-      const allDists = [...heatmapDists, ...audioDists];
+      const allDists = [
+        ...heatmapPeaks.filter(p => p >= start && p <= end).map(p => Math.abs(p - center)),
+        ...audioPeaks.filter(p => p >= start && p <= end).map(p => Math.abs(p - center))
+      ];
       const centerQuality = allDists.length > 0 ? 30 * (1 - Math.min(...allDists) / (targetDuration / 2)) : 0;
 
-      // Densité
+      // Density bonus
       const dur = end - start;
       const totalPics = heatmapCount + audioCount;
       const densityBonus = Math.min((totalPics / dur) * 100, 25);
 
-      let score = (heatmapCount * 30) + (audioCount * 25) + (textScore * 0.6) + (phraseEnd ? 20 : 0) + emotionBoost + centerQuality + densityBonus;
-      if (!phraseEnd && heatmapCount === 0 && audioCount === 0) score -= 20;
+      // Weighted scoring : heatmap 40%, audio 30%, text 20%, density 10%
+      const rawScore = (heatmapCount * 40) + (audioCount * 30) + (textScore * 0.8) + densityBonus + centerQuality + emotionBoost + (phraseEnd ? 20 : 0) - silencePenalty;
+      let score = rawScore;
+      if (!phraseEnd && heatmapCount === 0 && audioCount === 0) score -= 25;
 
       const hook = phraseEnd ? generateHookFromText(phraseEnd.text) : generateHookFromText(segmentText);
       const description = generateFrenchDescription(segmentText);
       const firstWords = segmentText.replace(/\[(Music|Applause|Laughter)\]/gi, '').trim().split(/\s+/).slice(0, 5).join(' ');
       const peakLabel = [];
-      if (heatmapCount > 0) peakLabel.push(`${heatmapCount} pic${heatmapCount > 1 ? 's' : ''} d'audience YouTube`);
+      if (heatmapCount > 0) peakLabel.push(`${heatmapCount} pic${heatmapCount > 1 ? 's' : ''} heatmap`);
       if (audioCount > 0) peakLabel.push(`${audioCount} pic${audioCount > 1 ? 's' : ''} audio`);
 
       return {
@@ -804,7 +885,7 @@ app.post('/api/analyze', async (req, res) => {
         score: clamp(Math.round(score), 55, 99),
         hook,
         description,
-        reasoning: `Clip centré sur un moment fort à ${Math.round(peakTime)}s${peakLabel.length > 0 ? ` (${peakLabel.join(' + ')})` : ''} : « ${firstWords || '...'} ».`,
+        reasoning: `Clip centré sur un pic à ${Math.round(peakTime)}s${peakLabel.length > 0 ? ` (${peakLabel.join(' + ')})` : ''} : « ${firstWords || '...'} ».`,
         breakdown: {
           hook_strength: randomInt(70, 98),
           emotional_peak: randomInt(65, 95) + (emotionBoost > 0 ? 4 : 0),
@@ -812,42 +893,54 @@ app.post('/api/analyze', async (req, res) => {
           keyword_density: randomInt(60, 96),
           pacing: randomInt(70, 98)
         },
-        why_viral: `Ce segment capture un pic d'engagement détecté${peakLabel.length > 0 ? ` (${peakLabel.join(' + ')})` : ''} : il concentre l'attention du spectateur.`,
+        why_viral: `Ce segment capture un pic d'engagement${peakLabel.length > 0 ? ` (${peakLabel.join(' + ')})` : ''} : il concentre l'attention.`,
         suggested_title: hook,
         suggested_hashtags: ['#viral','#shorts','#pourtoi','#clip'],
-        reasons: {
-          heatmap: heatmapCount > 0,
-          audio: audioCount > 0,
-          phraseEnd: !!phraseEnd,
-          emotion: emotionBoost > 0
-        }
+        reasons: { heatmap: heatmapCount > 0, audio: audioCount > 0, phraseEnd: !!phraseEnd, emotion: emotionBoost > 0 }
       };
     }
 
-    const candidates = mergedPoints.map(p => buildClipAroundPeak(p.time, clipDuration));
+    const candidates = mergedPoints.map(p => buildClipAroundPeak(p.time));
     candidates.sort((a, b) => b.score - a.score);
 
-    // 4. Sélection des 5 meilleurs avec espacement minimum
+    // 3. Selection with temporal diversity : force at least 1 per third of video
     const selected = [];
-    const minGap = 20;
+    const minGap = 15;
     const maxDuration = 90;
+    const tiers = 3;
+    const tierSize = videoDuration / tiers;
 
+    for (let tier = 0; tier < tiers; tier++) {
+      if (selected.length >= 5) break;
+      const tierStart = tier * tierSize;
+      const tierEnd = (tier + 1) * tierSize;
+      const tierBest = candidates.find(c => c.start >= tierStart && c.start <= tierEnd && !selected.some(s => {
+        const overlap = Math.max(0, Math.min(c.end, s.end) - Math.max(c.start, s.start));
+        const gap = Math.max(c.start - s.end, s.start - c.end);
+        return overlap > 0 || gap < minGap;
+      }));
+      if (tierBest) {
+        if (tierBest.end - tierBest.start > maxDuration) tierBest.end = tierBest.start + maxDuration;
+        selected.push(tierBest);
+      }
+    }
+
+    // Fill remaining slots with global best
     for (const cand of candidates) {
       if (selected.length >= 5) break;
-
       const conflicts = selected.some(s => {
         const overlap = Math.max(0, Math.min(cand.end, s.end) - Math.max(cand.start, s.start));
         const gap = Math.max(cand.start - s.end, s.start - cand.end);
         return overlap > 0 || gap < minGap;
       });
-
       if (!conflicts) {
         if (cand.end - cand.start > maxDuration) cand.end = cand.start + maxDuration;
         selected.push(cand);
       }
     }
 
-    // Boost userQuery si présent
+    // PAS DE FALLBACK TEMPORIEL
+
     if (userQuery) {
       const q = userQuery.toLowerCase();
       selected.forEach(seg => {
@@ -866,6 +959,7 @@ app.post('/api/analyze', async (req, res) => {
       rawStats: {
         heatmapPeaks: heatmapPeaks.length,
         audioPeaks: audioPeaks.length,
+        scenePeaks: scenePeaks.length,
         transcriptWindows: windows.length
       }
     });
