@@ -803,38 +803,29 @@ app.post('/api/analyze', async (req, res) => {
       candidates.push(scoreSegment(start, end));
     }
 
-    // 4. Sélection adaptative : fusionne les pics proches, évite les trop éloignés
+    // 4. Sélection : pas de fusion, exclusion de chevauchement + gap min + cap durée
     candidates.sort((a, b) => b.score - a.score);
     const selected = [];
     const minGap = 15;
+    const maxDuration = 90;
 
     for (const cand of candidates) {
       if (selected.length >= 5) break;
 
-      let merged = false;
+      let conflicts = false;
       for (const s of selected) {
         const overlap = Math.max(0, Math.min(cand.end, s.end) - Math.max(cand.start, s.start));
         const gap = Math.max(cand.start - s.end, s.start - cand.end);
-
-        // Fusion si chevauchement ou très proche (< 10s)
-        if (overlap > 0 || gap < 10) {
-          const newStart = Math.min(s.start, cand.start);
-          const newEnd = Math.max(s.end, cand.end);
-          s.start = Math.floor(newStart);
-          s.end = Math.ceil(newEnd);
-          s.score = clamp(Math.round(Math.max(s.score, cand.score) + 3), 55, 99);
-          merged = true;
-          break;
-        }
-
-        // Rejeter si trop proche (< minGap)
-        if (gap < minGap) {
-          merged = true;
+        if (overlap > 0 || gap < minGap) {
+          conflicts = true;
           break;
         }
       }
 
-      if (!merged) {
+      if (!conflicts) {
+        if (cand.end - cand.start > maxDuration) {
+          cand.end = cand.start + maxDuration;
+        }
         selected.push(cand);
       }
     }
@@ -846,7 +837,10 @@ app.post('/api/analyze', async (req, res) => {
         const already = selected.some(s => s.start === cand.start && s.end === cand.end);
         if (already) continue;
         const tooClose = selected.some(s => Math.max(cand.start - s.end, s.start - cand.end) < minGap);
-        if (!tooClose) selected.push(cand);
+        if (!tooClose) {
+          if (cand.end - cand.start > maxDuration) cand.end = cand.start + maxDuration;
+          selected.push(cand);
+        }
       }
     }
 
