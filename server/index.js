@@ -803,7 +803,7 @@ app.post('/api/analyze', async (req, res) => {
       candidates.push(scoreSegment(start, end));
     }
 
-    // 4. Sélection : pas de fusion, exclusion de chevauchement + gap min + cap durée
+    // 4. Sélection stricte par score (PAS DE FUSION, PAS DE FALLBACK TEMPORIEL)
     candidates.sort((a, b) => b.score - a.score);
     const selected = [];
     const minGap = 15;
@@ -812,15 +812,11 @@ app.post('/api/analyze', async (req, res) => {
     for (const cand of candidates) {
       if (selected.length >= 5) break;
 
-      let conflicts = false;
-      for (const s of selected) {
+      const conflicts = selected.some(s => {
         const overlap = Math.max(0, Math.min(cand.end, s.end) - Math.max(cand.start, s.start));
         const gap = Math.max(cand.start - s.end, s.start - cand.end);
-        if (overlap > 0 || gap < minGap) {
-          conflicts = true;
-          break;
-        }
-      }
+        return overlap > 0 || gap < minGap;
+      });
 
       if (!conflicts) {
         if (cand.end - cand.start > maxDuration) {
@@ -830,33 +826,7 @@ app.post('/api/analyze', async (req, res) => {
       }
     }
 
-    // Remplissage si manquant
-    if (selected.length < 5) {
-      for (const cand of candidates) {
-        if (selected.length >= 5) break;
-        const already = selected.some(s => s.start === cand.start && s.end === cand.end);
-        if (already) continue;
-        const tooClose = selected.some(s => Math.max(cand.start - s.end, s.start - cand.end) < minGap);
-        if (!tooClose) {
-          if (cand.end - cand.start > maxDuration) cand.end = cand.start + maxDuration;
-          selected.push(cand);
-        }
-      }
-    }
-
-    // Fallback temporel pour garantir la répartition
-    if (selected.length < 5) {
-      const bucketSize = videoDuration / 5;
-      for (let i = 0; i < 5; i++) {
-        if (selected.length >= 5) break;
-        const bucketStart = i * bucketSize;
-        const bucketEnd = (i + 1) * bucketSize;
-        const fallback = candidates.find(c => c.start >= bucketStart && c.start <= bucketEnd && !selected.some(s => s.start === c.start && s.end === c.end));
-        if (fallback && !selected.some(s => Math.max(fallback.start - s.end, s.start - fallback.end) < minGap)) {
-          selected.push(fallback);
-        }
-      }
-    }
+    // PAS DE FALLBACK TEMPORIEL : mieux vaut 3 bons clips que 5 médiocres répartis mécaniquement
 
     // Boost userQuery si présent
     if (userQuery) {
