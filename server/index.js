@@ -708,105 +708,128 @@ app.post('/api/analyze', async (req, res) => {
 
     const emotionalWords = ['incroyable', 'impossible', 'regardez', 'wow', 'non', 'what', 'ouah', 'dingue', 'fou', 'génial', 'choquant', 'spectaculaire', 'jamais', 'toujours', 'best', 'amazing', 'crazy', 'insane', 'love', 'hate', 'need', 'want'];
 
-    // 2. Scoring par segment
-    function scoreSegment(start, end) {
-      let score = 0;
+    // 2. APPROCHE PIC-FIRST : on détecte les MOMENTS FORTS, puis on crée des clips centrés dessus
 
-      // Heatmap : +30 points par pic dans le segment
-      const heatmapCount = heatmapPeaks.filter(p => p >= start && p <= end).length;
-      const heatmapBoost = heatmapCount * 30;
-      score += heatmapBoost;
+    // 2a. Construire les points d'intérêt à partir des trois signaux
+    const interestPoints = [];
 
-      // Audio : +25 points par pic audio dans le segment
-      const audioCount = audioPeaks.filter(p => p >= start && p <= end).length;
-      const audioBoost = audioCount * 25;
-      score += audioBoost;
+    // Points heatmap
+    for (const p of heatmapPeaks) {
+      interestPoints.push({ time: p, source: 'heatmap', score: 30 });
+    }
 
-      // Transcript : construire le texte du segment à partir des windows
+    // Points audio
+    for (const p of audioPeaks) {
+      interestPoints.push({ time: p, source: 'audio', score: 25 });
+    }
+
+    // Points transcript : chaque window qui a un bon score texte
+    for (const w of windows) {
+      const mid = (w.start + w.end) / 2;
+      const textScore = scoreSegmentText(w.text);
+      if (textScore > 60) {
+        interestPoints.push({ time: mid, source: 'transcript', score: textScore * 0.4 });
+      }
+    }
+
+    // Agréger les points proches (< 5s) en un seul pic plus fort
+    interestPoints.sort((a, b) => a.time - b.time);
+    const mergedPoints = [];
+    for (const p of interestPoints) {
+      const last = mergedPoints[mergedPoints.length - 1];
+      if (last && Math.abs(last.time - p.time) < 5) {
+        last.score += p.score * 0.7;
+        last.sources = Array.from(new Set([...(last.sources || []), p.source]));
+      } else {
+        mergedPoints.push({ time: p.time, score: p.score, sources: [p.source] });
+      }
+    }
+
+    // Trier par score décroissant
+    mergedPoints.sort((a, b) => b.score - a.score);
+    console.log('[analyze] merged interest points:', mergedPoints.slice(0, 10).map(p => ({ time: p.time, score: Math.round(p.score), sources: p.sources })));
+
+    // 3. Pour chaque point d'intérêt, créer un clip CENTRÉ sur ce point
+    function buildClipAroundPeak(peakTime, targetDuration) {
+      let start = Math.max(0, peakTime - targetDuration / 2);
+      let end = Math.min(videoDuration, start + targetDuration);
+      // Réajuster si on dépasse à la fin
+      if (end - start < targetDuration && start > 0) {
+        start = Math.max(0, end - targetDuration);
+      }
+
+      // Snap end sur une phrase complète dans ±5s
+      const phraseCandidates = windows.filter(w => w.end >= end - 5 && w.end <= end + 5 && w.text.length > 10 && /[.!?]$/i.test(w.text));
+      if (phraseCandidates.length > 0) {
+        end = phraseCandidates.sort((a, b) => Math.abs(a.end - end) - Math.abs(b.end - end))[0].end;
+      }
+      // Si end est avant start, on corrige
+      if (end <= start) end = start + targetDuration;
+
+      // Recalculer le score EXACT de ce segment
       const segmentWindows = windows.filter(w => w.start >= start && w.end <= end);
       const segmentText = segmentWindows.map(w => w.text).join(' ');
-
-      // Score texte de base
       const textScore = scoreSegmentText(segmentText);
-      score += textScore * 0.6;
 
-      // Phrase complète qui finit dans le segment (+20)
+      const heatmapCount = heatmapPeaks.filter(p => p >= start && p <= end).length;
+      const audioCount = audioPeaks.filter(p => p >= start && p <= end).length;
       const phraseEnd = windows.find(w => w.end >= start && w.end <= end && w.text.length > 10 && /[.!?]$/i.test(w.text));
-      if (phraseEnd) score += 20;
-
-      // Émotion
       const emotionBoost = emotionalWords.filter(w => segmentText.toLowerCase().includes(w)).length * 15;
-      score += emotionBoost;
 
-      // Diversité : pénalise les segments vides
-      if (!phraseEnd && audioBoost === 0 && heatmapBoost === 0) score -= 20;
-
-      // Centre quality : un pic au centre vaut plus qu'aux bords
+      // Centre quality
       const center = (start + end) / 2;
       const heatmapDists = heatmapPeaks.filter(p => p >= start && p <= end).map(p => Math.abs(p - center));
       const audioDists = audioPeaks.filter(p => p >= start && p <= end).map(p => Math.abs(p - center));
       const allDists = [...heatmapDists, ...audioDists];
-      const centerQuality = allDists.length > 0 ? 30 * (1 - Math.min(...allDists) / (clipDuration / 2)) : 0;
-      score += centerQuality;
+      const centerQuality = allDists.length > 0 ? 30 * (1 - Math.min(...allDists) / (targetDuration / 2)) : 0;
 
-      // Densité : pics concentrés = moment intense
-      const duration = end - start;
+      // Densité
+      const dur = end - start;
       const totalPics = heatmapCount + audioCount;
-      const density = totalPics / duration;
-      const densityBonus = Math.min(density * 100, 25);
-      score += densityBonus;
+      const densityBonus = Math.min((totalPics / dur) * 100, 25);
+
+      let score = (heatmapCount * 30) + (audioCount * 25) + (textScore * 0.6) + (phraseEnd ? 20 : 0) + emotionBoost + centerQuality + densityBonus;
+      if (!phraseEnd && heatmapCount === 0 && audioCount === 0) score -= 20;
 
       const hook = phraseEnd ? generateHookFromText(phraseEnd.text) : generateHookFromText(segmentText);
       const description = generateFrenchDescription(segmentText);
       const firstWords = segmentText.replace(/\[(Music|Applause|Laughter)\]/gi, '').trim().split(/\s+/).slice(0, 5).join(' ');
       const peakLabel = [];
-      if (heatmapBoost > 0) peakLabel.push(`${heatmapCount} pic${heatmapCount > 1 ? 's' : ''} d'audience YouTube`);
-      if (audioBoost > 0) peakLabel.push(`${audioCount} pic${audioCount > 1 ? 's' : ''} audio`);
+      if (heatmapCount > 0) peakLabel.push(`${heatmapCount} pic${heatmapCount > 1 ? 's' : ''} d'audience YouTube`);
+      if (audioCount > 0) peakLabel.push(`${audioCount} pic${audioCount > 1 ? 's' : ''} audio`);
 
       return {
-        start,
-        end,
+        start: Math.floor(start),
+        end: Math.ceil(end),
         score: clamp(Math.round(score), 55, 99),
         hook,
         description,
-        reasoning: `Clip repéré grâce à l'analyse combinée${peakLabel.length > 0 ? ` (${peakLabel.join(' + ')})` : ''} : les mots « ${firstWords || '...'} » forment un moment dense à ${start}s.`,
+        reasoning: `Clip centré sur un moment fort à ${Math.round(peakTime)}s${peakLabel.length > 0 ? ` (${peakLabel.join(' + ')})` : ''} : « ${firstWords || '...'} ».`,
         breakdown: {
           hook_strength: randomInt(70, 98),
           emotional_peak: randomInt(65, 95) + (emotionBoost > 0 ? 4 : 0),
-          audio_cue: randomInt(60, 94) + (audioBoost > 0 || heatmapBoost > 0 ? 5 : 0),
+          audio_cue: randomInt(60, 94) + (audioCount > 0 || heatmapCount > 0 ? 5 : 0),
           keyword_density: randomInt(60, 96),
           pacing: randomInt(70, 98)
         },
-        why_viral: `Ce segment repose sur du contenu parlé concret${peakLabel.length > 0 ? ` et un pic d'engagement détecté` : ''} : il donne envie de rester pour comprendre la suite.`,
+        why_viral: `Ce segment capture un pic d'engagement détecté${peakLabel.length > 0 ? ` (${peakLabel.join(' + ')})` : ''} : il concentre l'attention du spectateur.`,
         suggested_title: hook,
         suggested_hashtags: ['#viral','#shorts','#pourtoi','#clip'],
         reasons: {
-          heatmap: heatmapBoost > 0,
-          audio: audioBoost > 0,
+          heatmap: heatmapCount > 0,
+          audio: audioCount > 0,
           phraseEnd: !!phraseEnd,
           emotion: emotionBoost > 0
-        },
-        centerQuality,
-        densityBonus
+        }
       };
     }
 
-    // 3. Générer les candidats glissants (pas de 3s) avec snap phrase
-    const candidates = [];
-    for (let start = 0; start <= videoDuration - minDuration; start += 3) {
-      let end = Math.min(start + clipDuration, videoDuration);
-      const phraseCandidates = windows.filter(w => w.end >= end - 5 && w.end <= end + 5 && w.text.length > 10 && /[.!?]$/i.test(w.text));
-      if (phraseCandidates.length > 0) {
-        end = phraseCandidates.sort((a, b) => Math.abs(a.end - end) - Math.abs(b.end - end))[0].end;
-      }
-      if (end - start < minDuration) continue;
-      candidates.push(scoreSegment(start, end));
-    }
-
-    // 4. Sélection stricte par score (PAS DE FUSION, PAS DE FALLBACK TEMPORIEL)
+    const candidates = mergedPoints.map(p => buildClipAroundPeak(p.time, clipDuration));
     candidates.sort((a, b) => b.score - a.score);
+
+    // 4. Sélection des 5 meilleurs avec espacement minimum
     const selected = [];
-    const minGap = 15;
+    const minGap = 20;
     const maxDuration = 90;
 
     for (const cand of candidates) {
@@ -819,14 +842,10 @@ app.post('/api/analyze', async (req, res) => {
       });
 
       if (!conflicts) {
-        if (cand.end - cand.start > maxDuration) {
-          cand.end = cand.start + maxDuration;
-        }
+        if (cand.end - cand.start > maxDuration) cand.end = cand.start + maxDuration;
         selected.push(cand);
       }
     }
-
-    // PAS DE FALLBACK TEMPORIEL : mieux vaut 3 bons clips que 5 médiocres répartis mécaniquement
 
     // Boost userQuery si présent
     if (userQuery) {
