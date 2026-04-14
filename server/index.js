@@ -713,11 +713,13 @@ app.post('/api/analyze', async (req, res) => {
       let score = 0;
 
       // Heatmap : +30 points par pic dans le segment
-      const heatmapBoost = heatmapPeaks.filter(p => p >= start && p <= end).length * 30;
+      const heatmapCount = heatmapPeaks.filter(p => p >= start && p <= end).length;
+      const heatmapBoost = heatmapCount * 30;
       score += heatmapBoost;
 
       // Audio : +25 points par pic audio dans le segment
-      const audioBoost = audioPeaks.filter(p => p >= start && p <= end).length * 25;
+      const audioCount = audioPeaks.filter(p => p >= start && p <= end).length;
+      const audioBoost = audioCount * 25;
       score += audioBoost;
 
       // Transcript : construire le texte du segment à partir des windows
@@ -726,7 +728,7 @@ app.post('/api/analyze', async (req, res) => {
 
       // Score texte de base
       const textScore = scoreSegmentText(segmentText);
-      score += textScore * 0.6; // pondéré pour ne pas écraser les signaux audio/heatmap
+      score += textScore * 0.6;
 
       // Phrase complète qui finit dans le segment (+20)
       const phraseEnd = windows.find(w => w.end >= start && w.end <= end && w.text.length > 10 && /[.!?]$/i.test(w.text));
@@ -739,12 +741,27 @@ app.post('/api/analyze', async (req, res) => {
       // Diversité : pénalise les segments vides
       if (!phraseEnd && audioBoost === 0 && heatmapBoost === 0) score -= 20;
 
+      // Centre quality : un pic au centre vaut plus qu'aux bords
+      const center = (start + end) / 2;
+      const heatmapDists = heatmapPeaks.filter(p => p >= start && p <= end).map(p => Math.abs(p - center));
+      const audioDists = audioPeaks.filter(p => p >= start && p <= end).map(p => Math.abs(p - center));
+      const allDists = [...heatmapDists, ...audioDists];
+      const centerQuality = allDists.length > 0 ? 30 * (1 - Math.min(...allDists) / (clipDuration / 2)) : 0;
+      score += centerQuality;
+
+      // Densité : pics concentrés = moment intense
+      const duration = end - start;
+      const totalPics = heatmapCount + audioCount;
+      const density = totalPics / duration;
+      const densityBonus = Math.min(density * 100, 25);
+      score += densityBonus;
+
       const hook = phraseEnd ? generateHookFromText(phraseEnd.text) : generateHookFromText(segmentText);
       const description = generateFrenchDescription(segmentText);
       const firstWords = segmentText.replace(/\[(Music|Applause|Laughter)\]/gi, '').trim().split(/\s+/).slice(0, 5).join(' ');
       const peakLabel = [];
-      if (heatmapBoost > 0) peakLabel.push(`${heatmapBoost / 30} pic${heatmapBoost > 30 ? 's' : ''} d'audience YouTube`);
-      if (audioBoost > 0) peakLabel.push(`${audioBoost / 25} pic${audioBoost > 25 ? 's' : ''} audio`);
+      if (heatmapBoost > 0) peakLabel.push(`${heatmapCount} pic${heatmapCount > 1 ? 's' : ''} d'audience YouTube`);
+      if (audioBoost > 0) peakLabel.push(`${audioCount} pic${audioCount > 1 ? 's' : ''} audio`);
 
       return {
         start,
@@ -768,53 +785,82 @@ app.post('/api/analyze', async (req, res) => {
           audio: audioBoost > 0,
           phraseEnd: !!phraseEnd,
           emotion: emotionBoost > 0
-        }
+        },
+        centerQuality,
+        densityBonus
       };
     }
 
-    // 3. Générer tous les segments glissants (toutes les 5 secondes)
-    const segments = [];
-    const step = 5;
-    const targetEnd = videoDuration;
-    for (let start = 0; start < targetEnd - minDuration; start += step) {
-      let end = Math.min(start + clipDuration, targetEnd);
-      // Snap end to nearest phrase ending within ±5s tolerance
+    // 3. Générer les candidats glissants (pas de 3s) avec snap phrase
+    const candidates = [];
+    for (let start = 0; start <= videoDuration - minDuration; start += 3) {
+      let end = Math.min(start + clipDuration, videoDuration);
       const phraseCandidates = windows.filter(w => w.end >= end - 5 && w.end <= end + 5 && w.text.length > 10 && /[.!?]$/i.test(w.text));
       if (phraseCandidates.length > 0) {
-        end = phraseCandidates[phraseCandidates.length - 1].end;
+        end = phraseCandidates.sort((a, b) => Math.abs(a.end - end) - Math.abs(b.end - end))[0].end;
       }
-      if (end - start >= minDuration) {
-        segments.push(scoreSegment(start, end));
-      }
+      if (end - start < minDuration) continue;
+      candidates.push(scoreSegment(start, end));
     }
 
-    // 4. Sélection des 5 meilleurs avec répartition temporelle
-    segments.sort((a, b) => b.score - a.score);
-    const bucketSize = videoDuration / 5;
+    // 4. Sélection adaptative : fusionne les pics proches, évite les trop éloignés
+    candidates.sort((a, b) => b.score - a.score);
     const selected = [];
+    const minGap = 15;
 
-    // Un par bucket
-    for (let i = 0; i < 5; i++) {
-      const bucketStart = i * bucketSize;
-      const bucketEnd = (i + 1) * bucketSize;
-      const candidates = segments.filter(s => s.start >= bucketStart && s.start <= bucketEnd);
-      for (const seg of candidates) {
-        const tooClose = selected.some(s => Math.abs(s.start - seg.start) < 15);
-        if (!tooClose) {
-          selected.push(seg);
+    for (const cand of candidates) {
+      if (selected.length >= 5) break;
+
+      let merged = false;
+      for (const s of selected) {
+        const overlap = Math.max(0, Math.min(cand.end, s.end) - Math.max(cand.start, s.start));
+        const gap = Math.max(cand.start - s.end, s.start - cand.end);
+
+        // Fusion si chevauchement ou très proche (< 10s)
+        if (overlap > 0 || gap < 10) {
+          const newStart = Math.min(s.start, cand.start);
+          const newEnd = Math.max(s.end, cand.end);
+          s.start = Math.floor(newStart);
+          s.end = Math.ceil(newEnd);
+          s.score = clamp(Math.round(Math.max(s.score, cand.score) + 3), 55, 99);
+          merged = true;
+          break;
+        }
+
+        // Rejeter si trop proche (< minGap)
+        if (gap < minGap) {
+          merged = true;
           break;
         }
       }
+
+      if (!merged) {
+        selected.push(cand);
+      }
     }
 
-    // Remplir les manquants
+    // Remplissage si manquant
     if (selected.length < 5) {
-      for (const seg of segments) {
+      for (const cand of candidates) {
         if (selected.length >= 5) break;
-        const already = selected.some(s => s.start === seg.start && s.end === seg.end);
+        const already = selected.some(s => s.start === cand.start && s.end === cand.end);
         if (already) continue;
-        const tooClose = selected.some(s => Math.abs(s.start - seg.start) < 15);
-        if (!tooClose) selected.push(seg);
+        const tooClose = selected.some(s => Math.max(cand.start - s.end, s.start - cand.end) < minGap);
+        if (!tooClose) selected.push(cand);
+      }
+    }
+
+    // Fallback temporel pour garantir la répartition
+    if (selected.length < 5) {
+      const bucketSize = videoDuration / 5;
+      for (let i = 0; i < 5; i++) {
+        if (selected.length >= 5) break;
+        const bucketStart = i * bucketSize;
+        const bucketEnd = (i + 1) * bucketSize;
+        const fallback = candidates.find(c => c.start >= bucketStart && c.start <= bucketEnd && !selected.some(s => s.start === c.start && s.end === c.end));
+        if (fallback && !selected.some(s => Math.max(fallback.start - s.end, s.start - fallback.end) < minGap)) {
+          selected.push(fallback);
+        }
       }
     }
 
