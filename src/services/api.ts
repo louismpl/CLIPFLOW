@@ -43,6 +43,23 @@ export async function getTranscript(videoUrl: string) {
   return res.json() as Promise<{ transcript: string }>;
 }
 
+export async function analyzeVideoUnified(videoUrl: string, clipDuration: number, userQuery?: string) {
+  const res = await fetchWithTimeout(
+    `${API_BASE}/analyze`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ videoUrl, clipDuration, minDuration: Math.max(20, clipDuration - 15), userQuery }),
+    },
+    180000
+  ) as Response;
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || 'Erreur analyse combinée');
+  }
+  return res.json() as Promise<{ duration: number; clips: any[]; rawStats: { heatmapPeaks: number; audioPeaks: number; transcriptWindows: number } }>;
+}
+
 export async function getAudioAnalysis(videoUrl: string, end: number) {
   const res = await fetchWithTimeout(
     `${API_BASE}/audio-analysis`,

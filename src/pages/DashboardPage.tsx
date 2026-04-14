@@ -24,8 +24,8 @@ import { YoutubePlayer } from '../components/YoutubePlayer';
 import { ClipActions } from '../components/ClipActions';
 import { ExportStudio } from '../components/ExportStudio';
 import { AnalysisLoader } from '../components/AnalysisLoader';
-import { analyzeVideo, Clip } from '../services/gemini';
-import { getVideoInfo, getTranscript, getAudioAnalysis } from '../services/api';
+import { Clip } from '../services/gemini';
+import { getVideoInfo, analyzeVideoUnified } from '../services/api';
 import {
   saveAnalysis,
   getRemainingCredits,
@@ -93,6 +93,7 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
     setClips([]);
 
     try {
+      // 1. Infos rapides pour afficher la vidéo + loader
       const info = await getVideoInfo(targetUrl);
       const vd = {
         id: info.id,
@@ -105,80 +106,31 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
       setLoaderTitle(info.title);
       setShowLoader(true);
 
-      let transcriptJson = '';
-      try {
-        const transcriptRes = await getTranscript(targetUrl);
-        transcriptJson = transcriptRes.transcript || '';
-      } catch (e) {
-        console.warn('Transcript fetch failed:', e);
-      }
+      // 2. Analyse combinée (heatmap + audio + transcript) en UNE seule route
+      const result = await analyzeVideoUnified(targetUrl, clipDuration, targetQuery || undefined);
+      const clips = (result.clips || []) as Clip[];
 
-      // Affichage rapide des clips (sans analyse audio)
-      const initialClips = await analyzeVideo(
-        info.title,
-        `Une vidéo de ${info.author}`,
-        targetQuery || undefined,
-        info.duration,
-        transcriptJson || undefined,
-        undefined,
-        clipDuration,
-        info.heatmap_peaks
-      );
-      setClips(initialClips);
+      setClips(clips);
       setIsLoading(false);
 
-      const baseRecord: AnalysisRecord = {
+      const record: AnalysisRecord = {
         id: String(Date.now()),
         videoId: info.id,
         title: info.title,
         author: info.author,
         thumbnail: info.thumbnail,
-        clips: initialClips,
+        clips,
         query: targetQuery || undefined,
         date: new Date().toISOString(),
       };
-      saveAnalysis(baseRecord);
+      saveAnalysis(record);
       setHistory(getHistory().slice(0, 5));
-
-      // Analyse audio en arrière-plan pour booster les scores
-      getAudioAnalysis(targetUrl, info.duration)
-        .then((audioRes) => {
-          const peaks = audioRes.peaks || [];
-          if (peaks.length === 0) return;
-          if (currentAnalysisIdRef.current !== id) return;
-          analyzeVideo(
-            info.title,
-            `Une vidéo de ${info.author}`,
-            targetQuery || undefined,
-            info.duration,
-            transcriptJson || undefined,
-            peaks,
-            clipDuration,
-            info.heatmap_peaks
-          ).then((boostedClips) => {
-            if (currentAnalysisIdRef.current !== id) return;
-            setClips(boostedClips);
-            const boostedRecord: AnalysisRecord = {
-              id: String(Date.now()),
-              videoId: info.id,
-              title: info.title,
-              author: info.author,
-              thumbnail: info.thumbnail,
-              clips: boostedClips,
-              query: targetQuery || undefined,
-              date: new Date().toISOString(),
-            };
-            saveAnalysis(boostedRecord);
-            setHistory(getHistory().slice(0, 5));
-          });
-        })
-        .catch((e) => console.warn('Audio analysis failed:', e));
     } catch (err) {
       console.error(err);
       setError("L'analyse a échoué. Veuillez réessayer dans quelques instants.");
       setIsLoading(false);
     }
-  }, []);
+  }, [clipDuration]);
 
   // Auto-lance l'analyse pending au montage (placé après runAnalysis pour éviter le hoisting issue)
   const consumedPendingRef = useRef(false);
