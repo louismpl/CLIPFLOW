@@ -20,8 +20,36 @@ const YTDLP_PATH = path.join(__dirname, 'bin', 'yt-dlp');
 const FONT_PATH = path.join(__dirname, 'fonts', 'DejaVuSans.ttf');
 
 async function runYtDlp(args) {
-  const { stdout } = await execFileAsync(YTDLP_PATH, args, { maxBuffer: 1024 * 1024 * 20 });
+  const fullArgs = [
+    '--js-runtimes', 'node',
+    '--user-agent', 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    ...args
+  ];
+  const { stdout } = await execFileAsync(YTDLP_PATH, fullArgs, { maxBuffer: 1024 * 1024 * 20 });
   return stdout.trim();
+}
+
+async function runYtDlpWithFallback(args, extraCookieArgs = []) {
+  try {
+    return await runYtDlp(args);
+  } catch (err) {
+    const msg = (err.stderr || err.message || '').toString();
+    if (msg.includes("Sign in to confirm you're not a bot")) {
+      console.log('[yt-dlp] Bot block detected, trying Chrome cookies fallback...');
+      try {
+        const cookieArgs = [
+          '--cookies-from-browser', 'chrome',
+          ...extraCookieArgs,
+          ...args
+        ];
+        const { stdout } = await execFileAsync(YTDLP_PATH, cookieArgs, { maxBuffer: 1024 * 1024 * 20 });
+        return stdout.trim();
+      } catch (cookieErr) {
+        throw cookieErr;
+      }
+    }
+    throw err;
+  }
 }
 
 function extractHeatmapPeaks(info) {
@@ -37,11 +65,11 @@ function extractHeatmapPeaks(info) {
 }
 
 async function getVideoInfo(url) {
-  const json = await runYtDlp([
+  const json = await runYtDlpWithFallback([
     url,
     '--dump-json',
     '--no-download',
-    '--user-agent', 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+    '--ignore-no-formats-error'
   ]);
   const info = JSON.parse(json);
   info.heatmap_peaks = extractHeatmapPeaks(info);
@@ -215,7 +243,7 @@ async function getVideoTranscript(url, knownTitle = '') {
   fs.mkdirSync(tmpDir, { recursive: true });
 
   try {
-    await runYtDlp([
+    await runYtDlpWithFallback([
       url,
       '--write-auto-sub',
       '--sub-langs', 'fr,en',
@@ -313,7 +341,7 @@ async function downloadVideo(url, clipStart, clipEnd) {
     const sectionPath = path.join(downloadsDir, `${id}_${sectionStart}_${sectionEnd}.mp4`);
     if (fs.existsSync(sectionPath)) return { outputPath: sectionPath, info, sectionStart };
 
-    await runYtDlp([
+    await runYtDlpWithFallback([
       url,
       '-f', 'bestvideo[height<=1080]+bestaudio/bestvideo+bestaudio/best',
       '--download-sections', `*${sectionStart}-${sectionEnd}`,
@@ -328,7 +356,7 @@ async function downloadVideo(url, clipStart, clipEnd) {
   const outputPath = path.join(downloadsDir, `${id}.mp4`);
   if (fs.existsSync(outputPath)) return { outputPath, info, sectionStart: 0 };
 
-  await runYtDlp([
+  await runYtDlpWithFallback([
     url,
     '-f', 'best[ext=mp4]/best',
     '-o', outputPath,
@@ -343,7 +371,7 @@ async function downloadAudioOnly(url) {
   const outputPath = path.join(downloadsDir, `${id}.audio.webm`);
   if (fs.existsSync(outputPath)) return { outputPath, info };
 
-  await runYtDlp([
+  await runYtDlpWithFallback([
     url,
     '-f', 'bestaudio/best',
     '-o', outputPath,
@@ -509,8 +537,9 @@ async function processClip(inputPath, outputPath, { start, end, format, subtitle
   const vfChain = vf.length ? vf.join(',') : 'copy';
 
   return new Promise((resolve, reject) => {
+    // Use output-scoped -ss for precise A/V sync (inputOptions seeks to keyframes and drifts subtitles)
     let cmd = ffmpeg(inputPath)
-      .inputOptions(['-ss', String(segmentStart), '-to', String(segmentEnd)]);
+      .outputOptions(['-ss', String(segmentStart), '-t', String(duration)]);
 
     if (hasMusic) {
       const freq = music === 'electro' ? 220 : music === 'lofi' ? 330 : 440;
@@ -885,6 +914,16 @@ app.post('/api/analyze', async (req, res) => {
       const rawScore = (heatmapCount * 40) + (audioCount * 30) + (textScore * 0.8) + densityBonus + centerQuality + emotionBoost + (phraseEnd ? 20 : 0) - silencePenalty;
       let score = rawScore;
       if (!phraseEnd && heatmapCount === 0 && audioCount === 0) score -= 25;
+
+      // Intro penalty : beginning of videos is usually low-value filler (welcome, logos, silence)
+      let introPenalty = 0;
+      if (start < 3) introPenalty = 120;         // kill unless truly exceptional
+      else if (start < 10) introPenalty = 55;    // strong penalty for early intro
+      else if (start < 25) introPenalty = 25;
+      else if (start < 40) introPenalty = 10;
+      const isStrongIntro = heatmapCount >= 3 || audioCount >= 4 || textScore > 80;
+      if (isStrongIntro) introPenalty = Math.floor(introPenalty / 2);
+      score -= introPenalty;
 
       const hook = phraseEnd ? generateHookFromText(phraseEnd.text) : generateHookFromText(segmentText);
       const description = generateFrenchDescription(segmentText);

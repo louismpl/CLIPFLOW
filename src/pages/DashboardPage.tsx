@@ -128,9 +128,10 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
       };
       saveAnalysis(record);
       setHistory(getHistory().slice(0, 5));
-    } catch (err) {
+    } catch (err: any) {
       console.error(err);
-      setError("L'analyse a échoué. Veuillez réessayer dans quelques instants.");
+      const detail = err?.message || String(err);
+      setError(detail && detail !== 'undefined' ? detail : "L'analyse a échoué. Veuillez réessayer dans quelques instants.");
       setIsLoading(false);
     }
   }, [clipDuration]);
