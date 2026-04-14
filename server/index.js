@@ -676,16 +676,26 @@ app.post('/api/analyze', async (req, res) => {
     const videoDuration = info.duration || 0;
     if (videoDuration <= 0) return res.status(400).json({ error: 'Durée invalide' });
 
+    console.log('[analyze] start:', videoUrl, 'duration:', videoDuration);
+
     // Download video + transcript in parallel
+    // Use downloadVideo without section args to avoid slow --recode-video path
+    console.log('[analyze] downloading video + transcript...');
     const [downloadResult, transcriptData] = await Promise.all([
-      downloadVideo(videoUrl, 0, videoDuration),
+      downloadVideo(videoUrl),
       getVideoTranscript(videoUrl, info.title || '')
     ]);
 
     const { outputPath: videoPath } = downloadResult;
+    console.log('[analyze] video ready:', videoPath);
+
+    console.log('[analyze] extracting audio volume...');
     const { peaks: audioPeaks } = await extractAudioVolume(videoPath, 0, videoDuration);
+    console.log('[analyze] audio peaks:', audioPeaks.length);
 
     const heatmapPeaks = info.heatmap_peaks || [];
+    console.log('[analyze] heatmap peaks:', heatmapPeaks.length);
+
     let windows = [];
     let words = [];
     if (transcriptData) {
@@ -694,6 +704,7 @@ app.post('/api/analyze', async (req, res) => {
         words = JSON.parse(transcriptData.words || '[]');
       } catch {}
     }
+    console.log('[analyze] transcript windows:', windows.length);
 
     const emotionalWords = ['incroyable', 'impossible', 'regardez', 'wow', 'non', 'what', 'ouah', 'dingue', 'fou', 'génial', 'choquant', 'spectaculaire', 'jamais', 'toujours', 'best', 'amazing', 'crazy', 'insane', 'love', 'hate', 'need', 'want'];
 
@@ -818,6 +829,7 @@ app.post('/api/analyze', async (req, res) => {
     }
 
     selected.sort((a, b) => a.start - b.start);
+    console.log('[analyze] selected clips:', selected.map(s => ({ start: s.start, end: s.end, score: s.score })));
 
     res.json({
       duration: videoDuration,
