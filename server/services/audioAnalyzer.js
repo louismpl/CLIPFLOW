@@ -57,11 +57,14 @@ async function extractAudioVolume(inputPath, start = 0, end = null) {
     if (v.rms < silenceThreshold) {
       if (silenceStart === null) silenceStart = v.t;
     } else {
-      if (silenceStart !== null && v.t - silenceStart > 3) {
+      if (silenceStart !== null && v.t - silenceStart >= 3) {
         silenceMoments.push((silenceStart + v.t) / 2);
       }
       silenceStart = null;
     }
+  }
+  if (silenceStart !== null && rmsValues.length > 0 && (rmsValues[rmsValues.length - 1].t + windowSec - silenceStart) >= 3) {
+    silenceMoments.push((silenceStart + rmsValues[rmsValues.length - 1].t + windowSec) / 2);
   }
 
   const rhythmChanges = [];
