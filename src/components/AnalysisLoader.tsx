@@ -15,6 +15,7 @@ import { getAnalysisSteps, simulateAnalysisSteps } from '../services/smartAnalys
 interface AnalysisLoaderProps {
   videoTitle: string;
   onComplete: () => void;
+  isDone?: boolean;
 }
 
 const STEP_ICONS: Record<string, React.ReactNode> = {
@@ -26,11 +27,12 @@ const STEP_ICONS: Record<string, React.ReactNode> = {
   finalize: <Sparkles className="w-5 h-5" />,
 };
 
-export const AnalysisLoader: React.FC<AnalysisLoaderProps> = ({ videoTitle, onComplete }) => {
+export const AnalysisLoader: React.FC<AnalysisLoaderProps> = ({ videoTitle, onComplete, isDone = false }) => {
   const [currentStepId, setCurrentStepId] = useState<string | null>(null);
   const [completedSteps, setCompletedSteps] = useState<Set<string>>(new Set());
   const [progress, setProgress] = useState(0);
   const [funFactIndex, setFunFactIndex] = useState(0);
+  const [animationFinished, setAnimationFinished] = useState(false);
 
   const steps = getAnalysisSteps();
 
@@ -64,14 +66,21 @@ export const AnalysisLoader: React.FC<AnalysisLoaderProps> = ({ videoTitle, onCo
       }
       if (!isMounted) return;
       setProgress(100);
-      setTimeout(() => onComplete(), 400);
+      setAnimationFinished(true);
     };
 
     run();
     return () => {
       isMounted = false;
     };
-  }, [onComplete]);
+  }, []);
+
+  useEffect(() => {
+    if (animationFinished && isDone) {
+      const t = setTimeout(() => onComplete(), 400);
+      return () => clearTimeout(t);
+    }
+  }, [animationFinished, isDone, onComplete]);
 
   return (
     <div className="fixed inset-0 z-[80] flex items-center justify-center p-6">

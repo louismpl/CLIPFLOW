@@ -53,6 +53,7 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
   const [isLoading, setIsLoading] = useState(false);
   const [showLoader, setShowLoader] = useState(false);
   const [loaderTitle, setLoaderTitle] = useState('');
+  const [analysisDone, setAnalysisDone] = useState(false);
   const [videoData, setVideoData] = useState<{ id: string; title: string; author: string; thumbnail: string } | null>(null);
   const [clips, setClips] = useState<Clip[]>([]);
   const [activeStartTime, setActiveStartTime] = useState<number | undefined>(undefined);
@@ -105,6 +106,7 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
       setVideoDuration(info.duration);
       setLoaderTitle(info.title);
       setShowLoader(true);
+      setAnalysisDone(false);
 
       // 2. Analyse combinée (heatmap + audio + transcript) en UNE seule route
       const result = await analyzeVideoUnified(targetUrl, clipDuration, targetQuery || undefined);
@@ -112,6 +114,7 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
 
       setClips(clips);
       setIsLoading(false);
+      setAnalysisDone(true);
 
       const record: AnalysisRecord = {
         id: String(Date.now()),
@@ -525,7 +528,7 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
         </div>
       </main>
 
-      {showLoader && <AnalysisLoader videoTitle={loaderTitle} onComplete={onLoaderComplete} />}
+      {showLoader && <AnalysisLoader videoTitle={loaderTitle} onComplete={onLoaderComplete} isDone={analysisDone} />}
 
       {exportStudioOpen && selectedClipForExport && videoData && (
         <ExportStudio
