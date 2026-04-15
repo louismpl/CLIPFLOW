@@ -1,7 +1,3 @@
-function randomInt(min, max) {
-  return Math.floor(Math.random() * (max - min + 1)) + min;
-}
-
 function clamp(n, min, max) {
   return Math.max(min, Math.min(max, n));
 }
@@ -55,34 +51,71 @@ function scoreSegmentText(text) {
   return score;
 }
 
-function generateHookFromText(text) {
+function extractBestSentence(text) {
   const cleaned = text.replace(/\[(Music|Applause|Laughter)\]/gi, '').replace(/\s+/g, ' ').trim();
-  const lower = cleaned.toLowerCase();
-  if (lower.includes('?')) {
-    const idx = cleaned.indexOf('?');
-    const before = cleaned.slice(0, idx + 1);
-    const words = before.split(/\s+/);
-    const phrase = words.slice(Math.max(0, words.length - 10)).join(' ');
-    if (phrase.length > 8) return phrase;
+  if (!cleaned) return '';
+  const sentences = cleaned.split(/(?<=[.!?])\s+/).filter(s => s.trim().length > 8);
+  if (sentences.length === 0) {
+    const words = cleaned.split(/\s+/);
+    return words.slice(0, 10).join(' ') + (words.length > 10 ? '...' : '');
   }
-  if (lower.includes('!')) {
-    const idx = cleaned.indexOf('!');
-    const before = cleaned.slice(0, idx + 1);
-    const words = before.split(/\s+/);
-    const phrase = words.slice(Math.max(0, words.length - 10)).join(' ');
-    if (phrase.length > 8) return phrase;
+
+  const ranked = sentences.map(s => {
+    let prio = 0;
+    if (s.includes('?')) prio += 3;
+    if (s.includes('!')) prio += 2;
+    if (/\d/.test(s)) prio += 1;
+    const lower = s.toLowerCase();
+    const powerWords = ['incroyable','impossible','génial','dingue','fou','énorme','spectaculaire','choquant','surprenant','jamais','exceptionnel','terrible','magnifique','déteste','adore','aime','secret','vérité','mensonge','problème','solution','astuce','erreur','victoire','succès','wow','révélation','choc','crazy','insane','love','hate','need','want','amazing','unbelievable'];
+    powerWords.forEach(pw => { if (lower.includes(pw)) prio += 1; });
+    return { s: s.trim(), prio };
+  });
+
+  ranked.sort((a, b) => b.prio - a.prio);
+  return ranked[0].s;
+}
+
+function generateHookFromText(text) {
+  const sentence = extractBestSentence(text);
+  if (!sentence || sentence.length < 3) {
+    return 'Extrait viral';
   }
-  const words = cleaned.split(/\s+/).filter(w => w.length > 1);
-  const snippet = words.slice(0, 9).join(' ');
-  if (snippet.length > 10) return `« ${snippet}... »`;
-  return snippet || 'Moment fort';
+  if (sentence.length > 100) {
+    const words = sentence.split(/\s+/);
+    return words.slice(0, 12).join(' ') + '...';
+  }
+  return sentence;
 }
 
 function generateFrenchDescription(text) {
   const cleaned = text.replace(/\[(Music|Applause|Laughter)\]/gi, '').replace(/\s+/g, ' ').trim();
-  if (cleaned.length < 15) return 'Segment sélectionné pour son rythme et son potentiel viral.';
-  const excerpt = cleaned.slice(0, 220);
-  return `Ce passage parle de : « ${excerpt}${excerpt.length >= 220 ? '...' : ''} »`;
+  if (cleaned.length < 15) return cleaned || 'Segment intéressant extrait de la vidéo.';
+  const excerpt = cleaned.slice(0, 280);
+  return `${excerpt}${excerpt.length >= 280 ? '...' : ''}`;
+}
+
+function buildWhyViral({ heatmapCount, audioCount, textScore, emotionBoost, phraseEnd, peakTime, segmentText }) {
+  const reasons = [];
+  if (heatmapCount >= 3) reasons.push('forte concentration de pics d\'engagement');
+  else if (heatmapCount > 0) reasons.push('pic d\'engagement détecté');
+
+  if (audioCount >= 3) reasons.push('dynamique audio très marquée');
+  else if (audioCount > 0) reasons.push('changement dynamique audio');
+
+  if (textScore > 70) reasons.push('discours particulièrement accrocheur');
+  else if (textScore > 50) reasons.push('contenu textuel engageant');
+
+  if (emotionBoost > 0) reasons.push('pic émotionnel');
+  if (phraseEnd && /\?/.test(phraseEnd.text)) reasons.push('question rhétorique captivante');
+  if (phraseEnd && /\!/.test(phraseEnd.text)) reasons.push('exclamation impactante');
+
+  if (reasons.length === 0) {
+    return `Ce moment à ${Math.round(peakTime)}s concentre l'attention du spectateur.`;
+  }
+
+  const last = reasons.pop();
+  if (reasons.length === 0) return `Ce segment se distingue par ${last}.`;
+  return `Ce segment se distingue par ${reasons.join(', ')} et ${last}.`;
 }
 
 function selectClips({
@@ -121,6 +154,15 @@ function selectClips({
       mergedPoints.push({ time: p.time, score: p.weight, sources: [p.source] });
     }
   }
+
+  // HARD FILTER: drop intro interest points unless they are truly exceptional
+  const filteredPoints = mergedPoints.filter(p => {
+    if (p.time >= 15) return true;
+    const localHeatmap = heatmapPeaks.filter(h => Math.abs(h - p.time) < 8).length;
+    const localAudio = audioPeaks.filter(a => Math.abs(a - p.time) < 8).length;
+    const localText = windows.filter(w => Math.abs(((w.start + w.end) / 2) - p.time) < 8 && scoreSegmentText(w.text) > 75).length;
+    return localHeatmap >= 2 || localAudio >= 3 || localText >= 1;
+  });
 
   function buildClipAroundPeak(peakTime) {
     const localHeatmap = heatmapPeaks.filter(p => Math.abs(p - peakTime) < 15).length;
@@ -167,44 +209,51 @@ function selectClips({
     let score = rawScore;
     if (!phraseEnd && heatmapCount === 0 && audioCount === 0) score -= 25;
 
+    // additional intro penalty for anything still landing early
     let introPenalty = 0;
-    if (start < 3) introPenalty = 120;
-    else if (start < 10) introPenalty = 55;
-    else if (start < 25) introPenalty = 25;
-    else if (start < 40) introPenalty = 10;
-    const isStrongIntro = heatmapCount >= 3 || audioCount >= 4 || textScore > 80;
-    if (isStrongIntro) introPenalty = Math.floor(introPenalty / 2);
+    if (start < 5) introPenalty = 200;
+    else if (start < 15) introPenalty = 80;
+    else if (start < 30) introPenalty = 30;
+    else if (start < 45) introPenalty = 10;
     score -= introPenalty;
 
     const hook = phraseEnd ? generateHookFromText(phraseEnd.text) : generateHookFromText(segmentText);
     const description = generateFrenchDescription(segmentText);
-    const firstWords = segmentText.replace(/\[(Music|Applause|Laughter)\]/gi, '').trim().split(/\s+/).slice(0, 5).join(' ');
     const peakLabel = [];
     if (heatmapCount > 0) peakLabel.push(`${heatmapCount} pic${heatmapCount > 1 ? 's' : ''} heatmap`);
     if (audioCount > 0) peakLabel.push(`${audioCount} pic${audioCount > 1 ? 's' : ''} audio`);
 
+    const whyViral = buildWhyViral({ heatmapCount, audioCount, textScore, emotionBoost, phraseEnd, peakTime, segmentText });
+
+    // Real breakdown derived from actual metrics
+    const hookStrength = clamp(Math.round(50 + (textScore * 0.35) + (emotionBoost * 0.4) + (phraseEnd ? 8 : 0)), 20, 98);
+    const emotionalPeak = clamp(Math.round(45 + (emotionBoost * 1.2) + (exclCount(segmentText) * 6) + (questionCount(segmentText) * 5)), 20, 98);
+    const audioCue = clamp(Math.round(40 + (audioCount * 10) + (heatmapCount * 8) + (rhythmChanges.filter(r => r.time >= start && r.time <= end).length * 12)), 20, 98);
+    const keywordDensity = clamp(Math.round(40 + (textScore * 0.45)), 20, 98);
+    const pacing = clamp(Math.round(50 + (totalPics / Math.max(dur, 1)) * 40 - silencesInSegment * 12), 20, 98);
+
     return {
       start: Math.floor(start),
       end: Math.ceil(end),
-      score: clamp(Math.round(score), 55, 99),
+      score: Math.max(0, Math.round(score)),
       hook,
       description,
-      reasoning: `Clip centré sur un pic à ${Math.round(peakTime)}s${peakLabel.length > 0 ? ` (${peakLabel.join(' + ')})` : ''} : « ${firstWords || '...'} ».`,
+      reasoning: `Pic détecté à ${Math.round(peakTime)}s${peakLabel.length > 0 ? ` (${peakLabel.join(' + ')})` : ''}. ${hook}`,
       breakdown: {
-        hook_strength: randomInt(70, 98),
-        emotional_peak: randomInt(65, 95) + (emotionBoost > 0 ? 4 : 0),
-        audio_cue: randomInt(60, 94) + (audioCount > 0 || heatmapCount > 0 ? 5 : 0),
-        keyword_density: randomInt(60, 96),
-        pacing: randomInt(70, 98)
+        hook_strength: hookStrength,
+        emotional_peak: emotionalPeak,
+        audio_cue: audioCue,
+        keyword_density: keywordDensity,
+        pacing: pacing
       },
-      why_viral: `Ce segment capture un pic d'engagement${peakLabel.length > 0 ? ` (${peakLabel.join(' + ')})` : ''} : il concentre l'attention.`,
+      why_viral: whyViral,
       suggested_title: hook,
       suggested_hashtags: ['#viral','#shorts','#pourtoi','#clip'],
       reasons: { heatmap: heatmapCount > 0, audio: audioCount > 0, phraseEnd: !!phraseEnd, emotion: emotionBoost > 0 }
     };
   }
 
-  const candidates = mergedPoints.map(p => buildClipAroundPeak(p.time));
+  const candidates = filteredPoints.map(p => buildClipAroundPeak(p.time));
   candidates.sort((a, b) => b.score - a.score);
 
   const selected = [];
@@ -245,17 +294,24 @@ function selectClips({
     const q = userQuery.toLowerCase();
     selected.forEach(seg => {
       if (seg.hook.toLowerCase().includes(q) || seg.description.toLowerCase().includes(q)) {
-        seg.score = clamp(seg.score + 5, 55, 99);
+        seg.score = seg.score + 5;
       }
     });
   }
 
-  selected.sort((a, b) => a.start - b.start);
+  // BEST CLIPS FIRST — sort by quality score descending
+  selected.sort((a, b) => b.score - a.score);
   return selected;
 }
 
+function exclCount(text) {
+  return (text.match(/\!/g) || []).length;
+}
+function questionCount(text) {
+  return (text.match(/\?/g) || []).length;
+}
+
 module.exports = {
-  randomInt,
   clamp,
   scoreSegmentText,
   generateHookFromText,
