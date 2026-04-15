@@ -49,7 +49,7 @@ export async function analyzeVideoUnified(videoUrl: string, clipDuration: number
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ videoUrl, clipDuration, minDuration: Math.max(20, clipDuration - 15), userQuery }),
+      body: JSON.stringify({ videoUrl, clipDuration, minDuration: Math.max(15, Math.round(clipDuration * 0.75)), userQuery }),
     },
     180000
   ) as Response;

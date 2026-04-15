@@ -2,6 +2,10 @@ function clamp(n, min, max) {
   return Math.max(min, Math.min(max, n));
 }
 
+function toTitleCase(text) {
+  return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
 function scoreSegmentText(text) {
   const lower = text.toLowerCase();
   const words = lower.split(/\s+/).filter(w => w.length > 1);
@@ -80,21 +84,27 @@ function generateHookFromText(text) {
   if (!sentence || sentence.length < 3) {
     return 'Extrait viral';
   }
-  if (sentence.length > 100) {
-    const words = sentence.split(/\s+/);
-    return words.slice(0, 12).join(' ') + '...';
-  }
-  return sentence;
+  const words = sentence.split(/\s+/);
+  const concise = words.slice(0, 10).join(' ') + (words.length > 10 ? '...' : '');
+  return toTitleCase(concise);
 }
 
-function generateFrenchDescription(text) {
+function generateFrenchDescription(text, { audioCount, heatmapCount, emotionBoost }) {
   const cleaned = text.replace(/\[(Music|Applause|Laughter)\]/gi, '').replace(/\s+/g, ' ').trim();
-  if (cleaned.length < 15) return cleaned || 'Segment intéressant extrait de la vidéo.';
-  const excerpt = cleaned.slice(0, 280);
-  return `${excerpt}${excerpt.length >= 280 ? '...' : ''}`;
+  if (cleaned.length >= 30) {
+    const excerpt = cleaned.slice(0, 320);
+    return `${excerpt}${excerpt.length >= 320 ? '...' : ''}`;
+  }
+  // Contextual description when transcript is poor
+  const parts = [];
+  if (heatmapCount >= 2) parts.push('forte densité d\'engagement détectée');
+  if (audioCount >= 3) parts.push('dynamique audio très marquée');
+  if (emotionBoost > 0) parts.push('pic émotionnel dans le discours');
+  if (parts.length === 0) parts.push('moment clé de la vidéo');
+  return `Ce passage est marqué par ${parts.join(', ')}.`;
 }
 
-function buildWhyViral({ heatmapCount, audioCount, textScore, emotionBoost, phraseEnd, peakTime, segmentText }) {
+function buildWhyViral({ heatmapCount, audioCount, textScore, emotionBoost, phraseEnd, peakTime }) {
   const reasons = [];
   if (heatmapCount >= 3) reasons.push('forte concentration de pics d\'engagement');
   else if (heatmapCount > 0) reasons.push('pic d\'engagement détecté');
@@ -169,8 +179,8 @@ function selectClips({
     const localAudio = audioPeaks.filter(p => Math.abs(p - peakTime) < 15).length;
     const density = localHeatmap + localAudio;
     let targetDuration = clipDuration;
-    if (density >= 3) targetDuration = Math.max(minDuration, clipDuration - 15);
-    else if (density === 0) targetDuration = Math.min(60, clipDuration + 10);
+    if (density >= 3) targetDuration = Math.max(minDuration, Math.round(clipDuration * 0.85));
+    else if (density === 0) targetDuration = Math.min(60, Math.round(clipDuration * 1.12));
 
     let start = Math.max(0, peakTime - targetDuration / 2);
     let end = Math.min(videoDuration, start + targetDuration);
@@ -191,7 +201,7 @@ function selectClips({
     const heatmapCount = heatmapPeaks.filter(p => p >= start && p <= end).length;
     const audioCount = audioPeaks.filter(p => p >= start && p <= end).length;
     const phraseEnd = windows.find(w => w.end >= start && w.end <= end && w.text.length > 10 && /[.!?]$/i.test(w.text));
-    const emotionBoost = emotionalWords.filter(w => segmentText.toLowerCase().includes(w)).length * 15;
+    const emotionBoost = emotionalWords.filter(w => segmentText.toLowerCase().includes(w)).length * 20;
     const silencesInSegment = silenceMoments.filter(t => t >= start && t <= end).length;
     const silencePenalty = silencesInSegment * 15;
 
@@ -200,12 +210,12 @@ function selectClips({
       ...heatmapPeaks.filter(p => p >= start && p <= end).map(p => Math.abs(p - center)),
       ...audioPeaks.filter(p => p >= start && p <= end).map(p => Math.abs(p - center))
     ];
-    const centerQuality = allDists.length > 0 ? 30 * (1 - Math.min(...allDists) / (targetDuration / 2)) : 0;
+    const centerQuality = allDists.length > 0 ? 35 * (1 - Math.min(...allDists) / (targetDuration / 2)) : 0;
     const dur = end - start;
     const totalPics = heatmapCount + audioCount;
-    const densityBonus = Math.min((totalPics / dur) * 100, 25);
+    const densityBonus = Math.min((totalPics / dur) * 100, 30);
 
-    const rawScore = (heatmapCount * 40) + (audioCount * 30) + (textScore * 0.8) + densityBonus + centerQuality + emotionBoost + (phraseEnd ? 20 : 0) - silencePenalty;
+    const rawScore = (heatmapCount * 50) + (audioCount * 40) + (textScore * 1.0) + densityBonus + centerQuality + emotionBoost + (phraseEnd ? 25 : 0) - silencePenalty;
     let score = rawScore;
     if (!phraseEnd && heatmapCount === 0 && audioCount === 0) score -= 25;
 
@@ -218,14 +228,14 @@ function selectClips({
     score -= introPenalty;
 
     const hook = phraseEnd ? generateHookFromText(phraseEnd.text) : generateHookFromText(segmentText);
-    const description = generateFrenchDescription(segmentText);
+    const description = generateFrenchDescription(segmentText, { audioCount, heatmapCount, emotionBoost });
     const peakLabel = [];
     if (heatmapCount > 0) peakLabel.push(`${heatmapCount} pic${heatmapCount > 1 ? 's' : ''} heatmap`);
     if (audioCount > 0) peakLabel.push(`${audioCount} pic${audioCount > 1 ? 's' : ''} audio`);
 
-    const whyViral = buildWhyViral({ heatmapCount, audioCount, textScore, emotionBoost, phraseEnd, peakTime, segmentText });
+    const whyViral = buildWhyViral({ heatmapCount, audioCount, textScore, emotionBoost, phraseEnd, peakTime });
 
-    // Real breakdown derived from actual metrics
+    // Real breakdown derived from actual metrics (already 0-100ish)
     const hookStrength = clamp(Math.round(50 + (textScore * 0.35) + (emotionBoost * 0.4) + (phraseEnd ? 8 : 0)), 20, 98);
     const emotionalPeak = clamp(Math.round(45 + (emotionBoost * 1.2) + (exclCount(segmentText) * 6) + (questionCount(segmentText) * 5)), 20, 98);
     const audioCue = clamp(Math.round(40 + (audioCount * 10) + (heatmapCount * 8) + (rhythmChanges.filter(r => r.time >= start && r.time <= end).length * 12)), 20, 98);
@@ -235,7 +245,7 @@ function selectClips({
     return {
       start: Math.floor(start),
       end: Math.ceil(end),
-      score: Math.max(0, Math.round(score)),
+      rawScore: Math.max(0, Math.round(score)),
       hook,
       description,
       reasoning: `Pic détecté à ${Math.round(peakTime)}s${peakLabel.length > 0 ? ` (${peakLabel.join(' + ')})` : ''}. ${hook}`,
@@ -254,7 +264,13 @@ function selectClips({
   }
 
   const candidates = filteredPoints.map(p => buildClipAroundPeak(p.time));
-  candidates.sort((a, b) => b.score - a.score);
+  candidates.sort((a, b) => b.rawScore - a.rawScore);
+
+  // Normalize all scores to 0-100 based on the best candidate
+  const maxRaw = candidates.length > 0 ? Math.max(1, candidates[0].rawScore) : 1;
+  candidates.forEach(c => {
+    c.score = clamp(Math.round((c.rawScore / maxRaw) * 100), 0, 100);
+  });
 
   const selected = [];
   const minGap = 15;
@@ -294,12 +310,12 @@ function selectClips({
     const q = userQuery.toLowerCase();
     selected.forEach(seg => {
       if (seg.hook.toLowerCase().includes(q) || seg.description.toLowerCase().includes(q)) {
-        seg.score = seg.score + 5;
+        seg.score = clamp(seg.score + 5, 0, 100);
       }
     });
   }
 
-  // BEST CLIPS FIRST — sort by quality score descending
+  // BEST CLIPS FIRST — sort by normalized quality score descending
   selected.sort((a, b) => b.score - a.score);
   return selected;
 }

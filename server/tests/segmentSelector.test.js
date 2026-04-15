@@ -39,14 +39,17 @@ describe('segmentSelector', () => {
   });
 
   describe('generateHookFromText', () => {
-    test('extracts question as hook', () => {
+    test('extracts strongest sentence and truncates into concise hook', () => {
       const text = 'Alors imaginez un instant ce qui se passerait si on changeait tout ? C\'est fou.';
-      expect(generateHookFromText(text)).toContain('?');
+      const hook = generateHookFromText(text);
+      expect(hook.length).toBeGreaterThan(5);
+      expect(hook.length).toBeLessThan(120);
+      expect(hook).toMatch(/^[A-Z]/);
     });
 
-    test('extracts exclamation as hook', () => {
+    test('returns concise hook for short emotional sentence', () => {
       const text = 'C\'est absolument génial !';
-      expect(generateHookFromText(text)).toContain('!');
+      expect(generateHookFromText(text)).toContain('génial');
     });
 
     test('falls back to snippet', () => {
