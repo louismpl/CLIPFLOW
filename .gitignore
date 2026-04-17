@@ -6,3 +6,7 @@ coverage/
 *.log
 .env*
 !.env.example
+server/*-player-script.js
+server/test-export.js
+server/audio-*.raw
+/tmp/clipflow-downloads/

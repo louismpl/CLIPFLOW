@@ -235,17 +235,50 @@ function selectClips({
 
     const whyViral = buildWhyViral({ heatmapCount, audioCount, textScore, emotionBoost, phraseEnd, peakTime });
 
-    // Real breakdown derived from actual metrics (already 0-100ish)
-    const hookStrength = clamp(Math.round(50 + (textScore * 0.35) + (emotionBoost * 0.4) + (phraseEnd ? 8 : 0)), 20, 98);
-    const emotionalPeak = clamp(Math.round(45 + (emotionBoost * 1.2) + (exclCount(segmentText) * 6) + (questionCount(segmentText) * 5)), 20, 98);
-    const audioCue = clamp(Math.round(40 + (audioCount * 10) + (heatmapCount * 8) + (rhythmChanges.filter(r => r.time >= start && r.time <= end).length * 12)), 20, 98);
-    const keywordDensity = clamp(Math.round(40 + (textScore * 0.45)), 20, 98);
-    const pacing = clamp(Math.round(50 + (totalPics / Math.max(dur, 1)) * 40 - silencesInSegment * 12), 20, 98);
+    const rhythmInSegment = rhythmChanges.filter(r => r.time >= start && r.time <= end).length;
+    const exclamations = exclCount(segmentText);
+    const questions = questionCount(segmentText);
+
+    // Breakdowns on a real 0-100 scale (0 = poor, 100 = exceptional)
+    const hookStrength = clamp(Math.round(
+      Math.min((textScore / 120) * 60, 60) +
+      Math.min((emotionBoost / 80) * 25, 25) +
+      (phraseEnd ? 15 : 0)
+    ), 0, 100);
+
+    const emotionalPeak = clamp(Math.round(
+      Math.min((emotionBoost / 60) * 70, 70) +
+      exclamations * 8 +
+      questions * 8
+    ), 0, 100);
+
+    const audioCue = clamp(Math.round(
+      audioCount * 12 +
+      heatmapCount * 10 +
+      rhythmInSegment * 15
+    ), 0, 100);
+
+    const keywordDensity = clamp(Math.round(
+      Math.min(textScore / 1.4, 100)
+    ), 0, 100);
+
+    const pacing = clamp(Math.round(
+      Math.min((totalPics / Math.max(dur, 1)) * 90, 100) -
+      silencesInSegment * 18
+    ), 0, 100);
+
+    const avgBreakdown = (hookStrength + emotionalPeak + audioCue + keywordDensity + pacing) / 5;
+
+    // Global score = 50% breakdown coherence + 50% raw signal strength against a reference perfect clip (300 pts)
+    const REFERENCE_MAX = 300;
+    const signalScore = (Math.max(0, score) / REFERENCE_MAX) * 100;
+    const finalScore = clamp(Math.round(0.5 * avgBreakdown + 0.5 * signalScore), 0, 100);
 
     return {
       start: Math.floor(start),
       end: Math.ceil(end),
       rawScore: Math.max(0, Math.round(score)),
+      score: finalScore,
       hook,
       description,
       reasoning: `Pic détecté à ${Math.round(peakTime)}s${peakLabel.length > 0 ? ` (${peakLabel.join(' + ')})` : ''}. ${hook}`,
@@ -265,12 +298,6 @@ function selectClips({
 
   const candidates = filteredPoints.map(p => buildClipAroundPeak(p.time));
   candidates.sort((a, b) => b.rawScore - a.rawScore);
-
-  // Normalize all scores to 0-100 based on the best candidate
-  const maxRaw = candidates.length > 0 ? Math.max(1, candidates[0].rawScore) : 1;
-  candidates.forEach(c => {
-    c.score = clamp(Math.round((c.rawScore / maxRaw) * 100), 0, 100);
-  });
 
   const selected = [];
   const minGap = 15;
